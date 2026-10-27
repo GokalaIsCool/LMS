@@ -1,15 +1,25 @@
 from flask import Flask, redirect, render_template, request, flash
 import sqlite3
 import csv
+import os
 from flask import Response
 
 app = Flask(__name__)
-app.secret_key = "library_management_system"
+# Bug 1 Fix: secret key from env-var, not hardcoded in source
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
+
+# Bug 12 Fix: absolute DB path so the app works regardless of cwd
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "library.db")
+
+
+def get_db():
+    """Return a new SQLite connection using the absolute DB path."""
+    return sqlite3.connect(DB_PATH)
 
 @app.route("/")
 def home():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     # Total books
@@ -83,7 +93,7 @@ def home():
 @app.route("/books", methods=["GET", "POST"])
 def books():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     # Add Book
@@ -94,7 +104,14 @@ def books():
         category = request.form["category"]
         quantity = request.form["quantity"]
 
-        if int(quantity) <= 0:
+        try:
+            qty_int = int(quantity)
+        except ValueError:
+            flash("Quantity must be a valid number.", "error")
+            conn.close()
+            return redirect("/books")
+        # Bug 2a Fix: guard against non-numeric input before int() cast
+        if qty_int <= 0:
             flash(
                 "Quantity must be greater than zero.",
                 "error"
@@ -115,7 +132,7 @@ def books():
             cursor.execute("""
                 INSERT INTO books(title,author,category,quantity)
                 VALUES(?,?,?,?)
-            """,(title,author,category,quantity))
+            """,(title,author,category,qty_int))
 
             conn.commit()
 
@@ -157,7 +174,7 @@ def books():
 @app.route("/delete-book/<int:book_id>")
 def delete_book(book_id):
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     # Check if the book is currently issued
@@ -201,7 +218,7 @@ def delete_book(book_id):
 @app.route("/edit-book/<int:book_id>", methods=["GET", "POST"])
 def edit_book(book_id):
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     if request.method == "POST":
@@ -211,7 +228,14 @@ def edit_book(book_id):
         category = request.form["category"]
         quantity = request.form["quantity"]
 
-        if int(quantity) < 0:
+        try:
+            qty_int = int(quantity)
+        except ValueError:
+            flash("Quantity must be a valid number.", "error")
+            conn.close()
+            return redirect(f"/edit-book/{book_id}")
+        # Bug 2b Fix: guard against non-numeric input before int() cast
+        if qty_int < 0:
             flash(
                 "Quantity cannot be negative.",
                 "error")
@@ -227,14 +251,13 @@ def edit_book(book_id):
                 category=?,
                 quantity=?
             WHERE book_id=?
-        """, (title, author, category, quantity, book_id))
+        """, (title, author, category, qty_int, book_id))
 
         conn.commit()
         flash(
             "Book updated successfully!",
             "success")
-
-        conn.commit()
+        # Bug 7 Fix: removed duplicate conn.commit()
         conn.close()
 
         return redirect("/books")
@@ -258,7 +281,7 @@ def edit_book(book_id):
 @app.route("/members", methods=["GET", "POST"])
 def members():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     if request.method == "POST":
@@ -340,7 +363,7 @@ def members():
 @app.route("/edit-member/<int:member_id>", methods=["GET", "POST"])
 def edit_member(member_id):
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     if request.method == "POST":
@@ -348,6 +371,12 @@ def edit_member(member_id):
         name = request.form["name"]
         email = request.form["email"]
         phone = request.form["phone"]
+
+        # Bug 10 Fix: validate phone on edit, same rule as on add
+        if not phone.isdigit() or len(phone) != 10:
+            flash("Phone number must contain exactly 10 digits.", "error")
+            conn.close()
+            return redirect(f"/edit-member/{member_id}")
 
         cursor.execute("""SELECT * FROM members WHERE email = ? AND member_id != ? """, (email, member_id))
         
@@ -402,7 +431,7 @@ def edit_member(member_id):
 @app.route("/delete-member/<int:member_id>")
 def delete_member(member_id):
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -446,7 +475,7 @@ def delete_member(member_id):
 @app.route("/issue-book", methods=["GET", "POST"])
 def issue_book():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     if request.method == "POST":
@@ -483,7 +512,13 @@ def issue_book():
             (book_id,)
         )
 
-        quantity = cursor.fetchone()[0]
+        # Bug 3 Fix: guard against book_id not found in DB
+        row = cursor.fetchone()
+        if row is None:
+            flash("Book not found.", "error")
+            conn.close()
+            return redirect("/issue-book")
+        quantity = row[0]
 
         if quantity <= 0:
 
@@ -560,20 +595,28 @@ def issue_book():
 @app.route("/return-book", methods=["GET", "POST"])
 def return_book():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     if request.method == "POST":
 
         issue_id = request.form["issue_id"]
 
+        # Bug 4 + 5 Fix: fetch only un-returned records to prevent double-return
+        # and guard against None if issue_id is invalid / already returned
         cursor.execute("""
             SELECT book_id
             FROM issued_books
-            WHERE issue_id=?
+            WHERE issue_id=? AND return_date IS NULL
         """, (issue_id,))
 
-        book_id = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        if row is None:
+            flash("Invalid issue record or book already returned.", "error")
+            conn.close()
+            return redirect("/return-book")
+
+        book_id = row[0]
 
         cursor.execute("""
             UPDATE issued_books
@@ -588,6 +631,7 @@ def return_book():
         """, (book_id,))
 
         conn.commit()
+        flash("Book returned successfully!", "success")
 
     cursor.execute("""
         SELECT
@@ -614,7 +658,7 @@ def return_book():
 @app.route("/history")
 def history():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     search = request.args.get("search", "")
@@ -703,7 +747,7 @@ def history():
 @app.route("/export/books")
 def export_books():
 
-    conn = sqlite3.connect("library.db")
+    conn = get_db()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -716,12 +760,17 @@ def export_books():
     conn.close()
 
     def generate():
-
-        yield "ID,Title,Author,Category,Quantity\n"
-
+        import io
+        # Bug 11 Fix: use csv.writer to properly escape commas/quotes in data
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["ID", "Title", "Author", "Category", "Quantity"])
+        yield buf.getvalue()
         for book in books:
-
-            yield f"{book[0]},{book[1]},{book[2]},{book[3]},{book[4]}\n"
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(book)
+            yield buf.getvalue()
 
     return Response(
 
